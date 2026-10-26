@@ -62,6 +62,8 @@ dotnet run
 | 5 | Map Out Drive (Folder Inventory) | Prompts: root path (default `C:\`), MB threshold (default 10). Recursively walks every folder from root, computing total size/file count/subfolder count. Folders at/above the threshold are saved to `FolderMap` (tagged system/not-system + a best-guess description). Shows top folders by size when done. Skips access-denied folders. |
 | 6 | Clean Database 1 (File History Log) | Asks for confirmation (y/N, default No), then **permanently deletes every row** in `FileHistory` (the write/history log used by History/Top Files/Monthly reports) and reclaims disk space. Not reversible. |
 | 7 | Clean Database 2 (Folder Map Data) | Asks for confirmation (y/N, default No), then **permanently deletes every row** in `FolderMap` (the Map Out scan data) and reclaims disk space. Not reversible. |
-| 8 | Exit | Stops watcher and quits. |
+| 8 | View Raw Database Tables | Pick `FileHistory` or `FolderMap`, enter how many rows to show (default 50). Dumps the raw table, newest rows first — no grouping, no filtering, just what's actually stored. |
+| 9 | Folder Growth Since Last Scan | Compares the two most recent Map Out scans folder-by-folder. Shows which folders grew, shrunk, newly appeared, or disappeared since the previous scan, sorted by biggest change first. Needs at least 2 Map Out scans (option 5) to work. |
+| 10 | Exit | Stops watcher and quits. |
 
 Navigation: `↑`/`↓` to select, `Enter` to confirm.

@@ -69,6 +69,21 @@ internal sealed record FolderMapEntry(
     public double TotalSizeMb => TotalSizeBytes / 1024.0 / 1024.0;
 }
 
+/// <summary>
+/// One folder's size comparison between two Map Out scans — used to answer
+/// "has this folder grown since last time I scanned?"
+/// </summary>
+internal sealed record FolderGrowthRow(
+    string FolderPath,
+    long OldSizeBytes,
+    long NewSizeBytes,
+    string Status) // "NEW", "REMOVED", "GROWN", or "SHRUNK"
+{
+    public double OldSizeMb => OldSizeBytes / 1024.0 / 1024.0;
+    public double NewSizeMb => NewSizeBytes / 1024.0 / 1024.0;
+    public double DeltaMb => NewSizeMb - OldSizeMb;
+}
+
 // =============================================================================
 // DATABASE LAYER (thread-safe)
 // =============================================================================
@@ -361,6 +376,110 @@ internal static class DiskHistoryDatabase
         command.CommandText = "SELECT ScanId FROM FolderMap ORDER BY ScannedAt DESC LIMIT 1;";
         return command.ExecuteScalar() as string;
     }
+
+    /// <summary>Up to <paramref name="count"/> most recent distinct Map Out scans, newest first.</summary>
+    public static List<(string ScanId, DateTime ScannedAt)> GetRecentScanIds(int count = 10)
+    {
+        var results = new List<(string, DateTime)>();
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT ScanId, MAX(ScannedAt) AS LatestRow
+            FROM FolderMap
+            GROUP BY ScanId
+            ORDER BY LatestRow DESC
+            LIMIT $count;
+            """;
+        command.Parameters.AddWithValue("$count", count);
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            results.Add((reader.GetString(0), DateTime.Parse(reader.GetString(1), CultureInfo.InvariantCulture)));
+        }
+
+        return results;
+    }
+
+    /// <summary>All folder rows for one scan, keyed by folder path — used for before/after growth comparisons.</summary>
+    public static Dictionary<string, FolderMapEntry> GetFolderMapForScan(string scanId)
+    {
+        var results = new Dictionary<string, FolderMapEntry>(StringComparer.OrdinalIgnoreCase);
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT ScanId, FolderPath, ParentPath, TotalSizeBytes, FileCount, SubfolderCount, IsSystemFolder, Description, ScannedAt
+            FROM FolderMap
+            WHERE ScanId = $scanId;
+            """;
+        command.Parameters.AddWithValue("$scanId", scanId);
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var entry = ReadFolderMapEntry(reader);
+            results[entry.FolderPath] = entry;
+        }
+
+        return results;
+    }
+
+    /// <summary>Most recent rows in FileHistory, newest first — raw table viewer.</summary>
+    public static List<FileRecord> GetRecentFileHistoryRows(int limit = 50)
+    {
+        var results = new List<FileRecord>();
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT Id, FilePath, FileName, Extension, SizeBytes, IsSystemFile, Timestamp
+            FROM FileHistory
+            ORDER BY Timestamp DESC
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$limit", limit);
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            results.Add(ReadFileRecord(reader));
+        }
+
+        return results;
+    }
+
+    /// <summary>Most recent rows in FolderMap across all scans, newest first — raw table viewer.</summary>
+    public static List<FolderMapEntry> GetRecentFolderMapRows(int limit = 50)
+    {
+        var results = new List<FolderMapEntry>();
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT ScanId, FolderPath, ParentPath, TotalSizeBytes, FileCount, SubfolderCount, IsSystemFolder, Description, ScannedAt
+            FROM FolderMap
+            ORDER BY ScannedAt DESC
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$limit", limit);
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            results.Add(ReadFolderMapEntry(reader));
+        }
+
+        return results;
+    }
+
+    private static FolderMapEntry ReadFolderMapEntry(SqliteDataReader reader) => new(
+        ScanId: reader.GetString(0),
+        FolderPath: reader.GetString(1),
+        ParentPath: reader.GetString(2),
+        TotalSizeBytes: reader.GetInt64(3),
+        FileCount: reader.GetInt32(4),
+        SubfolderCount: reader.GetInt32(5),
+        IsSystemFolder: reader.GetInt64(6) == 1,
+        Description: reader.GetString(7),
+        ScannedAt: DateTime.Parse(reader.GetString(8), CultureInfo.InvariantCulture));
 
     /// <summary>
     /// Wipes every row from FileHistory ("Database 1" — the live write/history log) and
@@ -962,6 +1081,124 @@ internal static class ReportRenderer
             .Header($"[bold cyan] Map Out Results — Scan {scanId} ({foldersMapped} folders mapped, {foldersSkipped} access-denied skipped) [/]")
             .Expand());
     }
+
+    /// <summary>Raw dump of the FileHistory table — for debugging/inspection, no grouping or filtering.</summary>
+    public static void RenderRawFileHistory(List<FileRecord> rows, int requestedLimit)
+    {
+        var table = new Table().Border(TableBorder.Rounded).Expand();
+        table.AddColumn("[bold]Id[/]");
+        table.AddColumn("[bold]Timestamp[/]");
+        table.AddColumn("[bold]File Name[/]");
+        table.AddColumn("[bold]Ext[/]");
+        table.AddColumn(new TableColumn("[bold]Size (MB)[/]").RightAligned());
+        table.AddColumn("[bold]Type[/]");
+        table.AddColumn("[bold]Path[/]");
+
+        if (rows.Count == 0)
+        {
+            table.AddRow("[grey]--[/]", "[grey]--[/]", "[grey]No rows in FileHistory yet.[/]", "[grey]--[/]", "[grey]--[/]", "[grey]--[/]", "[grey]--[/]");
+        }
+
+        foreach (var row in rows)
+        {
+            table.AddRow(
+                row.Id.ToString(CultureInfo.InvariantCulture),
+                row.Timestamp.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
+                Markup.Escape(row.FileName),
+                Markup.Escape(row.Extension),
+                row.SizeMb.ToString("F2", CultureInfo.InvariantCulture),
+                row.IsSystemFile ? "[red]System[/]" : "[green]Safe[/]",
+                Markup.Escape(row.FilePath));
+        }
+
+        AnsiConsole.Write(new Panel(table)
+            .Header($"[bold cyan] Raw Table: FileHistory — {rows.Count} of up to {requestedLimit} most recent rows [/]")
+            .Expand());
+    }
+
+    /// <summary>Raw dump of the FolderMap table across all scans — for debugging/inspection.</summary>
+    public static void RenderRawFolderMap(List<FolderMapEntry> rows, int requestedLimit)
+    {
+        var table = new Table().Border(TableBorder.Rounded).Expand();
+        table.AddColumn("[bold]Scan[/]");
+        table.AddColumn("[bold]Scanned At[/]");
+        table.AddColumn("[bold]Folder[/]");
+        table.AddColumn(new TableColumn("[bold]Size (MB)[/]").RightAligned());
+        table.AddColumn(new TableColumn("[bold]Files[/]").RightAligned());
+        table.AddColumn(new TableColumn("[bold]Subfolders[/]").RightAligned());
+        table.AddColumn("[bold]Type[/]");
+
+        if (rows.Count == 0)
+        {
+            table.AddRow("[grey]--[/]", "[grey]--[/]", "[grey]No rows in FolderMap yet. Run Map Out first.[/]", "[grey]--[/]", "[grey]--[/]", "[grey]--[/]", "[grey]--[/]");
+        }
+
+        foreach (var row in rows)
+        {
+            string type = row.IsSystemFolder ? "[red]System[/]" : "[green]Safe[/]";
+            table.AddRow(
+                Markup.Escape(row.ScanId),
+                row.ScannedAt.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
+                Markup.Escape(row.FolderPath),
+                row.TotalSizeMb.ToString("F1", CultureInfo.InvariantCulture),
+                row.FileCount.ToString(CultureInfo.InvariantCulture),
+                row.SubfolderCount.ToString(CultureInfo.InvariantCulture),
+                type);
+        }
+
+        AnsiConsole.Write(new Panel(table)
+            .Header($"[bold cyan] Raw Table: FolderMap — {rows.Count} of up to {requestedLimit} most recent rows [/]")
+            .Expand());
+    }
+
+    /// <summary>
+    /// Compares the two most recent Map Out scans folder-by-folder, showing which ones grew,
+    /// shrunk, newly appeared, or dropped out since last time.
+    /// </summary>
+    public static void RenderFolderGrowth(string oldScanId, DateTime oldScannedAt, string newScanId, DateTime newScannedAt, List<FolderGrowthRow> rows)
+    {
+        var table = new Table().Border(TableBorder.Rounded).Expand();
+        table.AddColumn("[bold]Folder[/]");
+        table.AddColumn(new TableColumn("[bold]Old (MB)[/]").RightAligned());
+        table.AddColumn(new TableColumn("[bold]New (MB)[/]").RightAligned());
+        table.AddColumn(new TableColumn("[bold]Growth (MB)[/]").RightAligned());
+        table.AddColumn("[bold]Status[/]");
+
+        if (rows.Count == 0)
+        {
+            table.AddRow("[grey]No folders changed between these two scans.[/]", "[grey]--[/]", "[grey]--[/]", "[grey]--[/]", "[grey]--[/]");
+        }
+
+        foreach (var row in rows)
+        {
+            string statusTag = row.Status switch
+            {
+                "NEW" => "[yellow]New folder[/]",
+                "REMOVED" => "[grey]Gone / below threshold[/]",
+                "GROWN" => "[red]Grew[/]",
+                "SHRUNK" => "[green]Shrunk[/]",
+                _ => "[grey]--[/]",
+            };
+
+            string deltaText = row.DeltaMb switch
+            {
+                > 0 => $"[red]+{row.DeltaMb:F1}[/]",
+                < 0 => $"[green]{row.DeltaMb:F1}[/]",
+                _ => "0.0",
+            };
+
+            table.AddRow(
+                Markup.Escape(row.FolderPath),
+                row.OldSizeMb.ToString("F1", CultureInfo.InvariantCulture),
+                row.NewSizeMb.ToString("F1", CultureInfo.InvariantCulture),
+                deltaText,
+                statusTag);
+        }
+
+        AnsiConsole.Write(new Panel(table)
+            .Header($"[bold cyan] Folder Growth — {oldScannedAt:yyyy-MM-dd HH:mm} (scan {oldScanId}) -> {newScannedAt:yyyy-MM-dd HH:mm} (scan {newScanId}) [/]")
+            .Expand());
+    }
 }
 
 // =============================================================================
@@ -1027,34 +1264,43 @@ internal static class Program
                         "5. Map Out Drive (Folder Inventory - Data Range Min)",
                         "6. Clean Database 1 (File History Log)",
                         "7. Clean Database 2 (Folder Path Data )",
-                        "8. Exit"));
+                        "8. View Raw Database Tables",
+                        "9. Folder Growth Since Last Scan",
+                        "10. Exit"));
 
             try
             {
-                switch (choice[0])
+                string menuNumber = choice.Split('.', 2)[0];
+                switch (menuNumber)
                 {
-                    case '1':
+                    case "1":
                         watcherService = RunBackgroundTracking(watcherService);
                         break;
-                    case '2':
+                    case "2":
                         ReportRenderer.RenderRollingHistory();
                         break;
-                    case '3':
+                    case "3":
                         PromptAndRenderTopFilesInRange();
                         break;
-                    case '4':
+                    case "4":
                         ReportRenderer.RenderMonthlyFolderAccumulation();
                         break;
-                    case '5':
+                    case "5":
                         PromptAndRunMapOut();
                         break;
-                    case '6':
+                    case "6":
                         PromptAndCleanDatabase("FileHistory", "Database 1 (File History Log)", DiskHistoryDatabase.ClearFileHistory);
                         break;
-                    case '7':
+                    case "7":
                         PromptAndCleanDatabase("FolderMap", "Database 2 (Folder Map Data)", DiskHistoryDatabase.ClearFolderMap);
                         break;
-                    case '8':
+                    case "8":
+                        PromptAndViewRawTables();
+                        break;
+                    case "9":
+                        RenderFolderGrowthSinceLastScan();
+                        break;
+                    case "10":
                         watcherService?.Dispose();
                         AnsiConsole.MarkupLine("[grey]Goodbye.[/]");
                         return;
@@ -1138,6 +1384,92 @@ internal static class Program
             .Start($"Wiping {tableName}...", _ => rowsDeleted = clearAction());
 
         AnsiConsole.MarkupLine($"[green]{Markup.Escape(label)} cleared.[/] [bold]{rowsDeleted}[/] rows deleted, space reclaimed.");
+    }
+
+    /// <summary>Lets the user pick which raw table to dump and how many rows to show.</summary>
+    private static void PromptAndViewRawTables()
+    {
+        string tableChoice = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title("[bold]Which table do you want to view?[/]")
+                .HighlightStyle(new Style(foreground: Color.Cyan1))
+                .AddChoices(
+                    "FileHistory (Database 1 — file write/history log)",
+                    "FolderMap (Database 2 — folder inventory scans)"));
+
+        int limit = AnsiConsole.Prompt(
+            new TextPrompt<int>("[bold]How many rows[/] (most recent first)?")
+                .DefaultValue(50)
+                .Validate(n => n > 0 ? ValidationResult.Success() : ValidationResult.Error("[red]Must be greater than 0.[/]")));
+
+        if (tableChoice.StartsWith("FileHistory", StringComparison.Ordinal))
+        {
+            var rows = DiskHistoryDatabase.GetRecentFileHistoryRows(limit);
+            ReportRenderer.RenderRawFileHistory(rows, limit);
+        }
+        else
+        {
+            var rows = DiskHistoryDatabase.GetRecentFolderMapRows(limit);
+            ReportRenderer.RenderRawFolderMap(rows, limit);
+        }
+    }
+
+    /// <summary>
+    /// Compares the two most recent Map Out scans and reports which folders grew, shrunk,
+    /// appeared, or disappeared since the previous scan.
+    /// </summary>
+    private static void RenderFolderGrowthSinceLastScan()
+    {
+        var recentScans = DiskHistoryDatabase.GetRecentScanIds(2);
+
+        if (recentScans.Count < 2)
+        {
+            AnsiConsole.MarkupLine("[yellow]Need at least two Map Out scans to compare growth.[/] Run option 5 (Map Out Drive) twice, then try again.");
+            return;
+        }
+
+        // Newest first from GetRecentScanIds — [0] is "new", [1] is "old".
+        var (newScanId, newScannedAt) = recentScans[0];
+        var (oldScanId, oldScannedAt) = recentScans[1];
+
+        var oldMap = DiskHistoryDatabase.GetFolderMapForScan(oldScanId);
+        var newMap = DiskHistoryDatabase.GetFolderMapForScan(newScanId);
+
+        var allPaths = new HashSet<string>(oldMap.Keys, StringComparer.OrdinalIgnoreCase);
+        allPaths.UnionWith(newMap.Keys);
+
+        var growthRows = new List<FolderGrowthRow>();
+        foreach (var path in allPaths)
+        {
+            bool hasOld = oldMap.TryGetValue(path, out var oldEntry);
+            bool hasNew = newMap.TryGetValue(path, out var newEntry);
+
+            long oldSize = hasOld ? oldEntry!.TotalSizeBytes : 0;
+            long newSize = hasNew ? newEntry!.TotalSizeBytes : 0;
+
+            string status = (hasOld, hasNew) switch
+            {
+                (false, true) => "NEW",
+                (true, false) => "REMOVED",
+                _ when newSize > oldSize => "GROWN",
+                _ when newSize < oldSize => "SHRUNK",
+                _ => "SAME",
+            };
+
+            if (status == "SAME")
+            {
+                continue;
+            }
+
+            growthRows.Add(new FolderGrowthRow(path, oldSize, newSize, status));
+        }
+
+        var topGrowth = growthRows
+            .OrderByDescending(r => Math.Abs(r.DeltaMb))
+            .Take(20)
+            .ToList();
+
+        ReportRenderer.RenderFolderGrowth(oldScanId, oldScannedAt, newScanId, newScannedAt, topGrowth);
     }
 
     /// <summary>
