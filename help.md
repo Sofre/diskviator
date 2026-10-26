@@ -1,15 +1,14 @@
 # DiskViator — CLI COMMANDS
 
-## One-command install (recommended)
+## One-line install (from anywhere, no download needed)
 
-Installs the .NET SDK if needed, then builds and installs `diskviator` globally — all output is hidden/suppressed, just a few short status lines.
+Open PowerShell and run:
 
 ```powershell
-cd "d:\Bekap star disk\diskastorian"
-.\install.ps1
+irm https://raw.githubusercontent.com/Sofre/diskviator/main/install.ps1 | iex
 ```
 
-Or just double-click `install.bat`.
+This downloads the source straight from GitHub, installs the .NET SDK if it's missing, builds, and installs `diskviator` globally — no manual clone/download, no visible build noise, just a few short status lines. Re-running it later safely updates the existing install.
 
 Then open a NEW terminal window and run it from any folder:
 
@@ -17,7 +16,14 @@ Then open a NEW terminal window and run it from any folder:
 diskviator
 ```
 
-Re-running `.\install.ps1` later safely updates the existing install (no need to uninstall first).
+## Local install (if you already have the source on disk)
+
+```powershell
+cd "d:\Bekap star disk\diskastorian"
+.\install.ps1
+```
+
+Or just double-click `install.bat`.
 
 Uninstall:
 
