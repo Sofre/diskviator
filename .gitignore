@@ -1,0 +1,8 @@
+bin/
+obj/
+nupkg/
+*.db
+*.db-shm
+*.db-wal
+out.log
+err.log
