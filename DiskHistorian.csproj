@@ -2,12 +2,14 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>DiskViator</AssemblyName>
     <RootNamespace>DiskViator</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>icons8-traveler-64-256x256.ico</ApplicationIcon>
 
     <!-- .NET Global Tool packaging (see help.md for install steps).
          Lets you run DiskViator from any folder as the "diskviator" command. -->
@@ -23,6 +25,17 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
     <PackageReference Include="Spectre.Console" Version="0.49.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="icons8-traveler-64-32x32.ico" LogicalName="DiskViator.icons8-traveler-64-32x32.ico" />
+  </ItemGroup>
+
+  <!-- Keep WinForms types out of the console code so Spectre's Color/Style names stay unambiguous.
+       The tray code (TrayApp.cs) imports them explicitly. -->
+  <ItemGroup>
+    <Using Remove="System.Drawing" />
+    <Using Remove="System.Windows.Forms" />
   </ItemGroup>
 
 </Project>

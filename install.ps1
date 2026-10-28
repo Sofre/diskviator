@@ -1,7 +1,7 @@
 # =============================================================================
 # DiskViator — Silent Installer
-# Installs the .NET SDK if it's missing, then packs and installs DiskViator
-# as a global CLI tool so you can run it from anywhere as "diskviator".
+# Installs the .NET SDK if it's missing, publishes DiskViator, and adds the
+# "diskviator" command to the current user's PATH.
 #
 # Works two ways:
 #   - Local dev mode:  .\install.ps1          (run from inside the cloned repo)
@@ -9,9 +9,44 @@
 #                        (downloads the source itself, no manual clone/download needed)
 # =============================================================================
 
+param([switch]$Uninstall)
+
 $ErrorActionPreference = 'Stop'
 $RepoZipUrl = 'https://github.com/Sofre/diskviator/archive/refs/heads/main.zip'
 $LogDir = Join-Path $env:TEMP 'diskviator-install-logs'
+$InstallRoot = Join-Path $env:LOCALAPPDATA 'DiskViator'
+$InstallDir = Join-Path $InstallRoot 'app'
+$BinDir = Join-Path $InstallRoot 'bin'
+$CommandPath = Join-Path $BinDir 'diskviator.cmd'
+
+if ($Uninstall) {
+    if (Test-Path -LiteralPath $InstallDir) {
+        Remove-Item -LiteralPath $InstallDir -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $CommandPath) {
+        Remove-Item -LiteralPath $CommandPath -Force
+    }
+    $removeBinPath = -not (Test-Path -LiteralPath $BinDir)
+    if (Test-Path -LiteralPath $BinDir) {
+        if (-not (Get-ChildItem -LiteralPath $BinDir -Force | Select-Object -First 1)) {
+            Remove-Item -LiteralPath $BinDir -Force
+            $removeBinPath = $true
+        }
+    }
+
+    if ($removeBinPath) {
+        $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+        $remainingPath = @($userPath -split ';' | Where-Object {
+            $_ -and [string]::Compare($_.TrimEnd('\'), $BinDir.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) -ne 0
+        })
+        $newUserPath = $remainingPath -join ';'
+        [Environment]::SetEnvironmentVariable('PATH', $(if ($newUserPath) { $newUserPath } else { $null }), 'User')
+    }
+
+    Write-Host "DiskViator was uninstalled. Your database was preserved at $InstallRoot."
+    exit 0
+}
+
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 function Write-Step {
@@ -116,57 +151,77 @@ else {
     catch {
         Write-Fail "Could not install the .NET SDK automatically ($($_.Exception.Message))." $sdkLog
         Write-Host "  Install it manually from https://dotnet.microsoft.com/download/dotnet/8.0 and re-run this script." -ForegroundColor Yellow
+        if ($CleanupDir) { Remove-Item $CleanupDir -Recurse -Force -ErrorAction SilentlyContinue }
         exit 1
     }
 }
 
 # -----------------------------------------------------------------------------
-# Step 2: Pack DiskViator
+# Step 2: Publish DiskViator
 # -----------------------------------------------------------------------------
-Write-Step "Building DiskViator..."
-$packLog = Join-Path $LogDir 'pack.log'
-Push-Location $ProjectDir
+Write-Step "Publishing DiskViator..."
+$publishLog = Join-Path $LogDir 'publish.log'
+$PublishDir = Join-Path $env:TEMP ("diskviator-publish-" + [Guid]::NewGuid().ToString('N'))
+$RuntimeIdentifier = switch ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
+    'X64' { 'win-x64' }
+    'Arm64' { 'win-arm64' }
+    'X86' { 'win-x86' }
+    default { throw "Unsupported Windows architecture: $([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)" }
+}
+
 try {
-    & dotnet pack -c Release *> $packLog
+    & dotnet publish (Join-Path $ProjectDir 'DiskHistorian.csproj') -c Release -r $RuntimeIdentifier --self-contained true -o $PublishDir *> $publishLog
     if ($LASTEXITCODE -ne 0) {
-        throw "dotnet pack exited with code $LASTEXITCODE"
+        throw "dotnet publish exited with code $LASTEXITCODE"
     }
-    Write-Ok "Build complete."
+    Write-Ok "Publish complete."
 }
 catch {
-    Pop-Location
-    Write-Fail "Build failed." $packLog
+    Write-Fail "Publish failed." $publishLog
+    if (Test-Path -LiteralPath $PublishDir) { Remove-Item $PublishDir -Recurse -Force -ErrorAction SilentlyContinue }
     if ($CleanupDir) { Remove-Item $CleanupDir -Recurse -Force -ErrorAction SilentlyContinue }
     exit 1
 }
 
 # -----------------------------------------------------------------------------
-# Step 3: Install (or update) the global "diskviator" command
+# Step 3: Install or update the app and command shim
 # -----------------------------------------------------------------------------
-Write-Step "Installing the 'diskviator' command..."
-$toolLog = Join-Path $LogDir 'tool-install.log'
-$alreadyInstalled = (& dotnet tool list -g 2>$null) -match 'diskviator'
-
+Write-Step "Installing the DiskViator app and 'diskviator' command..."
 try {
-    if ($alreadyInstalled) {
-        & dotnet tool update -g DiskViator --add-source "$ProjectDir\nupkg" *> $toolLog
+    New-Item -ItemType Directory -Path $InstallDir, $BinDir -Force | Out-Null
+    Copy-Item -Path (Join-Path $PublishDir '*') -Destination $InstallDir -Recurse -Force
+    Set-Content -LiteralPath $CommandPath -Encoding ASCII -Value @(
+        '@echo off',
+        '"%LOCALAPPDATA%\DiskViator\app\DiskViator.exe" %*'
+    )
+
+    $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    $pathEntries = @($userPath -split ';' | Where-Object { $_ })
+    $hasBinPath = $pathEntries | Where-Object {
+        [string]::Compare($_.TrimEnd('\'), $BinDir.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) -eq 0
     }
-    else {
-        & dotnet tool install -g DiskViator --add-source "$ProjectDir\nupkg" *> $toolLog
+    if (-not $hasBinPath) {
+        $pathEntries += $BinDir
+        [Environment]::SetEnvironmentVariable('PATH', ($pathEntries -join ';'), 'User')
     }
-    if ($LASTEXITCODE -ne 0) {
-        throw "dotnet tool install/update exited with code $LASTEXITCODE"
+    $processPathEntries = @($env:PATH -split ';' | Where-Object { $_ })
+    $hasProcessBinPath = $processPathEntries | Where-Object {
+        [string]::Compare($_.TrimEnd('\'), $BinDir.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) -eq 0
     }
-    Write-Ok "DiskViator installed as a global command."
+    if (-not $hasProcessBinPath) {
+        $env:PATH = "$BinDir;$env:PATH"
+    }
+
+    Write-Ok "DiskViator installed."
 }
 catch {
-    Pop-Location
-    Write-Fail "Could not install the global command." $toolLog
+    Write-Fail "Could not install DiskViator." $publishLog
+    if (Test-Path -LiteralPath $PublishDir) { Remove-Item $PublishDir -Recurse -Force -ErrorAction SilentlyContinue }
     if ($CleanupDir) { Remove-Item $CleanupDir -Recurse -Force -ErrorAction SilentlyContinue }
     exit 1
 }
-Pop-Location
 
+Remove-Item -LiteralPath $PublishDir -Recurse -Force
 if ($CleanupDir) {
     Remove-Item $CleanupDir -Recurse -Force -ErrorAction SilentlyContinue
 }

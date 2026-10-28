@@ -64,7 +64,8 @@ internal sealed record FolderMapEntry(
     int SubfolderCount,
     bool IsSystemFolder,
     string Description,
-    DateTime ScannedAt)
+    DateTime ScannedAt,
+    long Id = 0)
 {
     public double TotalSizeMb => TotalSizeBytes / 1024.0 / 1024.0;
 }
@@ -88,6 +89,23 @@ internal sealed record FolderGrowthRow(
 // DATABASE LAYER (thread-safe)
 // =============================================================================
 
+/// <summary>Optional filters for the raw FileHistory viewer. Null fields are ignored.</summary>
+internal sealed record FileHistoryFilter(
+    long? Id = null,
+    string? NameContains = null,
+    string? Extension = null,
+    double? MinSizeMb = null,
+    DateTime? From = null,
+    DateTime? To = null,
+    bool? IsSystemFile = null);
+
+/// <summary>Optional filters for the raw FolderMap viewer. Null fields are ignored.</summary>
+internal sealed record FolderMapFilter(
+    long? Id = null,
+    string? ScanId = null,
+    string? PathContains = null,
+    double? MinSizeMb = null);
+
 /// <summary>
 /// Owns all SQLite access. Writes are serialized behind a single lock and each
 /// operation uses its own short-lived connection (with WAL + busy_timeout) so
@@ -98,6 +116,9 @@ internal sealed record FolderGrowthRow(
 internal static class DiskHistoryDatabase
 {
     private const string DbFileName = "DiskHistorian.db";
+
+    /// <summary>Days of history kept in FileHistory and FolderMap. Older rows are deleted automatically.</summary>
+    public const int RetentionDays = 30;
 
     // Installed as a global CLI tool, DiskViator can be launched from any working directory,
     // so the DB must live in a fixed, per-user location rather than "wherever you happen to run it".
@@ -268,6 +289,208 @@ internal static class DiskHistoryDatabase
         return results;
     }
 
+    /// <summary>Top N largest files whose recorded size is at least <paramref name="minSizeBytes"/>, deduplicated by path. No date filter.</summary>
+    public static List<FileRecord> GetTopFilesAboveSize(long minSizeBytes, int topN = 10)
+    {
+        var results = new List<FileRecord>();
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                MAX(Id) AS Id,
+                FilePath,
+                FileName,
+                Extension,
+                MAX(SizeBytes) AS SizeBytes,
+                MAX(IsSystemFile) AS IsSystemFile,
+                MAX(Timestamp) AS Timestamp
+            FROM FileHistory
+            WHERE SizeBytes >= $minSize
+            GROUP BY FilePath
+            ORDER BY SizeBytes DESC
+            LIMIT $top;
+            """;
+        command.Parameters.AddWithValue("$minSize", minSizeBytes);
+        command.Parameters.AddWithValue("$top", topN);
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            results.Add(ReadFileRecord(reader));
+        }
+
+        return results;
+    }
+
+    /// <summary>Deletes rows older than <paramref name="days"/> days from FileHistory and FolderMap. Returns rows removed per table.</summary>
+    public static (long FileRows, long ScanRows) PruneOlderThan(int days)
+    {
+        lock (WriteLock)
+        {
+            using var connection = OpenConnection();
+            using var command = connection.CreateCommand();
+            command.Parameters.AddWithValue("$cutoff", $"-{days} days");
+
+            command.CommandText = "DELETE FROM FileHistory WHERE Timestamp < datetime('now', 'localtime', $cutoff);";
+            long fileRows = command.ExecuteNonQuery();
+
+            command.CommandText = "DELETE FROM FolderMap WHERE ScannedAt < datetime('now', 'localtime', $cutoff);";
+            long scanRows = command.ExecuteNonQuery();
+
+            return (fileRows, scanRows);
+        }
+    }
+
+    public static int DeleteFileHistoryRows(IReadOnlyCollection<long> ids) => DeleteRowsById("FileHistory", ids);
+
+    public static int DeleteFolderMapRows(IReadOnlyCollection<long> ids) => DeleteRowsById("FolderMap", ids);
+
+    private static int DeleteRowsById(string table, IReadOnlyCollection<long> ids)
+    {
+        if (ids.Count == 0)
+        {
+            return 0;
+        }
+
+        lock (WriteLock)
+        {
+            using var connection = OpenConnection();
+            using var command = connection.CreateCommand();
+            var placeholders = new List<string>();
+            foreach (var id in ids)
+            {
+                string name = $"$id{placeholders.Count}";
+                placeholders.Add(name);
+                command.Parameters.AddWithValue(name, id);
+            }
+
+            command.CommandText = $"DELETE FROM {table} WHERE Id IN ({string.Join(", ", placeholders)});";
+            return command.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Filtered FileHistory rows, newest first. Every filled-in field must match (AND).</summary>
+    public static List<FileRecord> QueryFileHistory(FileHistoryFilter filter, int limit = 50)
+    {
+        var clauses = new List<string>();
+        var results = new List<FileRecord>();
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+
+        if (filter.Id is { } id)
+        {
+            clauses.Add("Id = $id");
+            command.Parameters.AddWithValue("$id", id);
+        }
+        if (!string.IsNullOrWhiteSpace(filter.NameContains))
+        {
+            clauses.Add("FileName LIKE $name");
+            command.Parameters.AddWithValue("$name", $"%{filter.NameContains.Trim()}%");
+        }
+        if (!string.IsNullOrWhiteSpace(filter.Extension))
+        {
+            string ext = filter.Extension.Trim();
+            clauses.Add("Extension = $ext COLLATE NOCASE");
+            command.Parameters.AddWithValue("$ext", ext.StartsWith('.') ? ext : "." + ext);
+        }
+        if (filter.MinSizeMb is { } minMb)
+        {
+            clauses.Add("SizeBytes >= $minSize");
+            command.Parameters.AddWithValue("$minSize", (long)(minMb * 1024 * 1024));
+        }
+        if (filter.From is { } from)
+        {
+            clauses.Add("Timestamp >= $from");
+            command.Parameters.AddWithValue("$from", from.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+        }
+        if (filter.To is { } to)
+        {
+            clauses.Add("Timestamp <= $to");
+            command.Parameters.AddWithValue("$to", to.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+        }
+        if (filter.IsSystemFile is { } isSystem)
+        {
+            clauses.Add("IsSystemFile = $isSys");
+            command.Parameters.AddWithValue("$isSys", isSystem ? 1 : 0);
+        }
+
+        string where = clauses.Count == 0 ? string.Empty : "WHERE " + string.Join(" AND ", clauses);
+        command.CommandText = $"""
+            SELECT Id, FilePath, FileName, Extension, SizeBytes, IsSystemFile, Timestamp
+            FROM FileHistory
+            {where}
+            ORDER BY Timestamp DESC
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$limit", limit);
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            results.Add(ReadFileRecord(reader));
+        }
+
+        return results;
+    }
+
+    /// <summary>Filtered FolderMap rows, newest first. Every filled-in field must match (AND).</summary>
+    public static List<FolderMapEntry> QueryFolderMap(FolderMapFilter filter, int limit = 50)
+    {
+        var clauses = new List<string>();
+        var results = new List<FolderMapEntry>();
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+
+        if (filter.Id is { } id)
+        {
+            clauses.Add("Id = $id");
+            command.Parameters.AddWithValue("$id", id);
+        }
+        if (!string.IsNullOrWhiteSpace(filter.ScanId))
+        {
+            clauses.Add("ScanId = $scanId");
+            command.Parameters.AddWithValue("$scanId", filter.ScanId.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(filter.PathContains))
+        {
+            clauses.Add("FolderPath LIKE $path");
+            command.Parameters.AddWithValue("$path", $"%{filter.PathContains.Trim()}%");
+        }
+        if (filter.MinSizeMb is { } minMb)
+        {
+            clauses.Add("TotalSizeBytes >= $minSize");
+            command.Parameters.AddWithValue("$minSize", (long)(minMb * 1024 * 1024));
+        }
+
+        string where = clauses.Count == 0 ? string.Empty : "WHERE " + string.Join(" AND ", clauses);
+        command.CommandText = $"""
+            SELECT Id, ScanId, FolderPath, ParentPath, TotalSizeBytes, FileCount, SubfolderCount, IsSystemFolder, Description, ScannedAt
+            FROM FolderMap
+            {where}
+            ORDER BY ScannedAt DESC
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$limit", limit);
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            results.Add(new FolderMapEntry(
+                ScanId: reader.GetString(1),
+                FolderPath: reader.GetString(2),
+                ParentPath: reader.GetString(3),
+                TotalSizeBytes: reader.GetInt64(4),
+                FileCount: reader.GetInt32(5),
+                SubfolderCount: reader.GetInt32(6),
+                IsSystemFolder: reader.GetInt64(7) == 1,
+                Description: reader.GetString(8),
+                ScannedAt: DateTime.Parse(reader.GetString(9), CultureInfo.InvariantCulture),
+                Id: reader.GetInt64(0)));
+        }
+
+        return results;
+    }
+
     /// <summary>All file history rows recorded in the current calendar month (used for folder roll-ups).</summary>
     public static List<FileRecord> GetCurrentMonthRecords()
     {
@@ -419,52 +642,6 @@ internal static class DiskHistoryDatabase
         {
             var entry = ReadFolderMapEntry(reader);
             results[entry.FolderPath] = entry;
-        }
-
-        return results;
-    }
-
-    /// <summary>Most recent rows in FileHistory, newest first — raw table viewer.</summary>
-    public static List<FileRecord> GetRecentFileHistoryRows(int limit = 50)
-    {
-        var results = new List<FileRecord>();
-        using var connection = OpenConnection();
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT Id, FilePath, FileName, Extension, SizeBytes, IsSystemFile, Timestamp
-            FROM FileHistory
-            ORDER BY Timestamp DESC
-            LIMIT $limit;
-            """;
-        command.Parameters.AddWithValue("$limit", limit);
-
-        using var reader = command.ExecuteReader();
-        while (reader.Read())
-        {
-            results.Add(ReadFileRecord(reader));
-        }
-
-        return results;
-    }
-
-    /// <summary>Most recent rows in FolderMap across all scans, newest first — raw table viewer.</summary>
-    public static List<FolderMapEntry> GetRecentFolderMapRows(int limit = 50)
-    {
-        var results = new List<FolderMapEntry>();
-        using var connection = OpenConnection();
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT ScanId, FolderPath, ParentPath, TotalSizeBytes, FileCount, SubfolderCount, IsSystemFolder, Description, ScannedAt
-            FROM FolderMap
-            ORDER BY ScannedAt DESC
-            LIMIT $limit;
-            """;
-        command.Parameters.AddWithValue("$limit", limit);
-
-        using var reader = command.ExecuteReader();
-        while (reader.Read())
-        {
-            results.Add(ReadFolderMapEntry(reader));
         }
 
         return results;
@@ -741,6 +918,7 @@ internal sealed class DiskWatcherService : IDisposable
 
     public int FilesLoggedCount;
     public int ErrorsSuppressedCount;
+    public string RootPath => _rootPath;
 
     public DiskWatcherService(string rootPath)
     {
@@ -964,11 +1142,12 @@ internal static class ReportRenderer
         AnsiConsole.Write(new Panel(chart).Header("[bold cyan] Disk Activity Trend [/]").Expand());
     }
 
-    public static void RenderTopFilesInRange(DateTime from, DateTime to)
+    public static void RenderTopFilesAboveSize(long minSizeBytes)
     {
-        var files = DiskHistoryDatabase.GetTopFilesInRange(from, to, 10);
+        var files = DiskHistoryDatabase.GetTopFilesAboveSize(minSizeBytes, 10);
 
         var table = new Table().Border(TableBorder.Rounded).Expand();
+        table.AddColumn(new TableColumn("[bold]ID[/]").RightAligned());
         table.AddColumn("[bold]File Name[/]");
         table.AddColumn(new TableColumn("[bold]Size (MB)[/]").RightAligned());
         table.AddColumn("[bold]Path[/]");
@@ -976,25 +1155,24 @@ internal static class ReportRenderer
 
         if (files.Count == 0)
         {
-            table.AddRow("[grey]--[/]", "[grey]--[/]", "[grey]No files recorded in this range yet.[/]", "[grey]--[/]");
+            table.AddRow("[grey]--[/]", "[grey]--[/]", "[grey]--[/]", "[grey]No recorded files at or above this size yet.[/]", "[grey]--[/]");
         }
 
         foreach (var file in files)
         {
             string tag = file.IsSystemFile
-                ? "[red]❌ Windows OS System File[/]"
-                : "[green]✅ Safe to Delete[/]";
+                ? "[red] Windows OS System File[/]"
+                : "[green] Safe to Delete[/]";
 
             table.AddRow(
+                file.Id.ToString(CultureInfo.InvariantCulture),
                 Markup.Escape(file.FileName),
                 file.SizeMb.ToString("F2", CultureInfo.InvariantCulture),
                 Markup.Escape(file.FilePath),
                 tag);
         }
 
-        string header = from.Date == to.Date
-            ? $"[bold cyan] Top 10 Largest Files — {from:yyyy-MM-dd HH:mm} to {to:HH:mm} [/]"
-            : $"[bold cyan] Top 10 Largest Files — {from:yyyy-MM-dd HH:mm} to {to:yyyy-MM-dd HH:mm} [/]";
+        string header = $"[bold cyan] Top 10 Largest Files — at least {minSizeBytes / (1024.0 * 1024.0):F0} MB [/]";
 
         AnsiConsole.Write(new Panel(table).Header(header).Expand());
     }
@@ -1024,8 +1202,8 @@ internal static class ReportRenderer
         table.AddColumn("[bold]Rank[/]");
         table.AddColumn("[bold]Folder[/]");
         table.AddColumn(new TableColumn("[bold]Total (MB)[/]").RightAligned());
-        table.AddColumn(new TableColumn("[bold]❌ System Files[/]").Centered());
-        table.AddColumn(new TableColumn("[bold]✅ Safe Files[/]").Centered());
+        table.AddColumn(new TableColumn("[bold]System Files[/]").Centered());
+        table.AddColumn(new TableColumn("[bold]Safe Files[/]").Centered());
 
         int rank = 1;
         foreach (var folder in folderGroups)
@@ -1064,7 +1242,7 @@ internal static class ReportRenderer
         int rank = 1;
         foreach (var folder in folders)
         {
-            string type = folder.IsSystemFolder ? "[red]❌ System[/]" : "[green]✅ Safe[/]";
+            string type = folder.IsSystemFolder ? "[red]❌ System[/]" : "[green]Safe[/]";
             string description = string.IsNullOrEmpty(folder.Description) ? "[grey]--[/]" : Markup.Escape(folder.Description);
 
             table.AddRow(
@@ -1120,6 +1298,7 @@ internal static class ReportRenderer
     public static void RenderRawFolderMap(List<FolderMapEntry> rows, int requestedLimit)
     {
         var table = new Table().Border(TableBorder.Rounded).Expand();
+        table.AddColumn(new TableColumn("[bold]ID[/]").RightAligned());
         table.AddColumn("[bold]Scan[/]");
         table.AddColumn("[bold]Scanned At[/]");
         table.AddColumn("[bold]Folder[/]");
@@ -1130,13 +1309,14 @@ internal static class ReportRenderer
 
         if (rows.Count == 0)
         {
-            table.AddRow("[grey]--[/]", "[grey]--[/]", "[grey]No rows in FolderMap yet. Run Map Out first.[/]", "[grey]--[/]", "[grey]--[/]", "[grey]--[/]", "[grey]--[/]");
+            table.AddRow("[grey]--[/]", "[grey]--[/]", "[grey]--[/]", "[grey]No rows match. Run Map Out first, or loosen the filters.[/]", "[grey]--[/]", "[grey]--[/]", "[grey]--[/]", "[grey]--[/]");
         }
 
         foreach (var row in rows)
         {
             string type = row.IsSystemFolder ? "[red]System[/]" : "[green]Safe[/]";
             table.AddRow(
+                row.Id.ToString(CultureInfo.InvariantCulture),
                 Markup.Escape(row.ScanId),
                 row.ScannedAt.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
                 Markup.Escape(row.FolderPath),
@@ -1207,8 +1387,25 @@ internal static class ReportRenderer
 
 internal static class Program
 {
-    private static void Main()
+    [STAThread]
+    private static void Main(string[] args)
     {
+        if (args.Length > 0)
+        {
+            switch (args[0].ToLowerInvariant())
+            {
+                case "--tray":
+                    TrayHost.Run();
+                    return;
+                case "--install-startup":
+                    Environment.ExitCode = StartupTask.Install();
+                    return;
+                case "--remove-startup":
+                    Environment.ExitCode = StartupTask.Remove();
+                    return;
+            }
+        }
+
         Console.Title = "DiskViator";
 
         var travelerIcon = new Markup(
@@ -1226,19 +1423,20 @@ internal static class Program
         };
         AnsiConsole.Write(Align.Center(titleRow));
 
-      
         AnsiConsole.WriteLine();
-        AnsiConsole.WriteLine();
-        
-        AnsiConsole.Write(Align.Left(new Markup("[cyan italic]dev by Sofre[/]")));
-        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[white]Track large file writes, spot busy folders, and map existing disk usage.[/]");
+        AnsiConsole.MarkupLine("[grey]History and largest-file reports summarize tracked writes. Drive maps inventory folders already on disk, while growth compares scans. Your data stays local; files are never deleted.[/]");
         AnsiConsole.WriteLine();
 
         try
         {
             AnsiConsole.Status()
                 .Spinner(Spinner.Known.Dots)
-                .Start("Initializing database...", _ => DiskHistoryDatabase.Initialize());
+                .Start("Initializing database...", _ =>
+                {
+                    DiskHistoryDatabase.Initialize();
+                    DiskHistoryDatabase.PruneOlderThan(DiskHistoryDatabase.RetentionDays);
+                });
             AnsiConsole.MarkupLine($"[green]Database ready:[/] [grey]{Markup.Escape(DiskHistoryDatabase.DatabasePath)}[/]");
         }
         catch (Exception ex)
@@ -1259,14 +1457,15 @@ internal static class Program
                     .AddChoices(
                         "1. Start Monitoring",
                         "2. View 15-Day Rolling History",
-                        "3. Top 10 Largest Files (Date Range)",
+                        "3. Top 10 Largest Files (Min Size)",
                         "4. Monthly Folder Accumulation",
-                        "5. Map Out Drive (Folder Inventory - Data Range Min)",
-                        "6. Clean Database 1 (File History Log)",
-                        "7. Clean Database 2 (Folder Path Data )",
-                        "8. View Raw Database Tables",
+                        "5. Map Out Drive (Folder Inventory Instance)",
+                        "6. Clean File History Log",
+                        "7. Clean Folder Inventory",
+                        "8. View & Filter Database Tables",
                         "9. Folder Growth Since Last Scan",
-                        "10. Exit"));
+                        "10. Exit",
+                        "11. Setup Tray Monitoring (Folders)"));
 
             try
             {
@@ -1280,7 +1479,7 @@ internal static class Program
                         ReportRenderer.RenderRollingHistory();
                         break;
                     case "3":
-                        PromptAndRenderTopFilesInRange();
+                        PromptAndRenderTopFilesAboveSize();
                         break;
                     case "4":
                         ReportRenderer.RenderMonthlyFolderAccumulation();
@@ -1289,10 +1488,10 @@ internal static class Program
                         PromptAndRunMapOut();
                         break;
                     case "6":
-                        PromptAndCleanDatabase("FileHistory", "Database 1 (File History Log)", DiskHistoryDatabase.ClearFileHistory);
+                        PromptCleanMenu("FileHistory", "Database 1 (File History Log)", DiskHistoryDatabase.ClearFileHistory, DiskHistoryDatabase.DeleteFileHistoryRows);
                         break;
                     case "7":
-                        PromptAndCleanDatabase("FolderMap", "Database 2 (Folder Map Data)", DiskHistoryDatabase.ClearFolderMap);
+                        PromptCleanMenu("FolderMap", "Database 2 (Folder Map Data)", DiskHistoryDatabase.ClearFolderMap, DiskHistoryDatabase.DeleteFolderMapRows);
                         break;
                     case "8":
                         PromptAndViewRawTables();
@@ -1304,6 +1503,9 @@ internal static class Program
                         watcherService?.Dispose();
                         AnsiConsole.MarkupLine("[grey]Goodbye.[/]");
                         return;
+                    case "11":
+                        ConfigureTrayMonitoring();
+                        break;
                 }
             }
             catch (Exception ex)
@@ -1386,7 +1588,59 @@ internal static class Program
         AnsiConsole.MarkupLine($"[green]{Markup.Escape(label)} cleared.[/] [bold]{rowsDeleted}[/] rows deleted, space reclaimed.");
     }
 
-    /// <summary>Lets the user pick which raw table to dump and how many rows to show.</summary>
+    /// <summary>Clean submenu for a table: delete chosen rows by ID, wipe the whole table, or go back.</summary>
+    private static void PromptCleanMenu(
+        string tableName,
+        string label,
+        Func<long> clearAction,
+        Func<IReadOnlyCollection<long>, int> deleteByIdAction)
+    {
+        string choice = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title($"[bold]{Markup.Escape(label)}[/] — what do you want to do?")
+                .HighlightStyle(new Style(foreground: Color.Cyan1))
+                .AddChoices(
+                    "Delete specific rows by ID",
+                    "Wipe the entire table",
+                    "Back"));
+
+        switch (choice)
+        {
+            case "Delete specific rows by ID":
+                PromptAndDeleteById(tableName, label, deleteByIdAction);
+                break;
+            case "Wipe the entire table":
+                PromptAndCleanDatabase(tableName, label, clearAction);
+                break;
+        }
+    }
+
+    /// <summary>Deletes the rows whose IDs the user lists (comma-separated), after confirmation.</summary>
+    private static void PromptAndDeleteById(string tableName, string label, Func<IReadOnlyCollection<long>, int> deleteByIdAction)
+    {
+        string input = AnsiConsole.Prompt(
+            new TextPrompt<string>("[bold]Enter ID(s) to delete[/] (comma-separated, e.g. 4, 17, 20):")
+                .Validate(text => ParseIds(text) is { Count: > 0 }
+                    ? ValidationResult.Success()
+                    : ValidationResult.Error("[red]Enter one or more positive whole-number IDs.[/]")));
+
+        var ids = ParseIds(input)!;
+
+        bool confirmed = AnsiConsole.Confirm(
+            $"[red]Delete {ids.Count} row(s) with ID {Markup.Escape(string.Join(", ", ids))} from {Markup.Escape(tableName)}?[/]",
+            defaultValue: false);
+
+        if (!confirmed)
+        {
+            AnsiConsole.MarkupLine("[grey]Cancelled — no data was deleted.[/]");
+            return;
+        }
+
+        int rowsDeleted = deleteByIdAction(ids);
+        AnsiConsole.MarkupLine($"[bold]{rowsDeleted}[/] row(s) deleted from {Markup.Escape(label)}.");
+    }
+
+    /// <summary>Lets the user pick a raw table, optionally filter it (ID, text, size, dates), and show the newest rows.</summary>
     private static void PromptAndViewRawTables()
     {
         string tableChoice = AnsiConsole.Prompt(
@@ -1404,14 +1658,81 @@ internal static class Program
 
         if (tableChoice.StartsWith("FileHistory", StringComparison.Ordinal))
         {
-            var rows = DiskHistoryDatabase.GetRecentFileHistoryRows(limit);
+            var rows = DiskHistoryDatabase.QueryFileHistory(PromptFileHistoryFilter(), limit);
             ReportRenderer.RenderRawFileHistory(rows, limit);
         }
         else
         {
-            var rows = DiskHistoryDatabase.GetRecentFolderMapRows(limit);
+            var rows = DiskHistoryDatabase.QueryFolderMap(PromptFolderMapFilter(), limit);
             ReportRenderer.RenderRawFolderMap(rows, limit);
         }
+    }
+
+    private static FileHistoryFilter PromptFileHistoryFilter()
+    {
+        AnsiConsole.MarkupLine("[grey]Leave any filter blank to skip it. All filled-in filters must match.[/]");
+
+        long? id = PromptOptionalId();
+        string? name = PromptOptionalText("Filename contains");
+        string? extension = PromptOptionalText("Extension (e.g. .exe)");
+        double? minMb = PromptOptionalMb("Minimum size (MB)");
+        DateTime? fromDate = PromptOptionalDate("From date");
+        DateTime? toDate = PromptOptionalDate("To date (inclusive)");
+
+        // The To date covers the whole selected day, so extend it to 23:59:59.
+        DateTime? to = toDate?.Date.AddDays(1).AddSeconds(-1);
+
+        return new FileHistoryFilter(id, name, extension, minMb, fromDate?.Date, to);
+    }
+
+    private static FolderMapFilter PromptFolderMapFilter()
+    {
+        AnsiConsole.MarkupLine("[grey]Leave any filter blank to skip it. All filled-in filters must match.[/]");
+
+        return new FolderMapFilter(
+            Id: PromptOptionalId(),
+            ScanId: PromptOptionalText("Scan ID"),
+            PathContains: PromptOptionalText("Folder path contains"),
+            MinSizeMb: PromptOptionalMb("Minimum folder size (MB)"));
+    }
+
+    private static long? PromptOptionalId()
+    {
+        string? text = OptionalResult(AnsiConsole.Prompt(
+            new TextPrompt<string>("[bold]ID[/] (optional):")
+                .AllowEmpty()
+                .Validate(t => string.IsNullOrWhiteSpace(t) || long.TryParse(t.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out _)
+                    ? ValidationResult.Success()
+                    : ValidationResult.Error("[red]Enter a whole number.[/]"))));
+
+        return text is null ? null : long.Parse(text, CultureInfo.InvariantCulture);
+    }
+
+    private static string? PromptOptionalText(string label) =>
+        OptionalResult(AnsiConsole.Prompt(new TextPrompt<string>($"[bold]{label}[/] (optional):").AllowEmpty()));
+
+    private static double? PromptOptionalMb(string label)
+    {
+        string? text = OptionalResult(AnsiConsole.Prompt(
+            new TextPrompt<string>($"[bold]{label}[/] (optional):")
+                .AllowEmpty()
+                .Validate(t => string.IsNullOrWhiteSpace(t) || (double.TryParse(t.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && v >= 0)
+                    ? ValidationResult.Success()
+                    : ValidationResult.Error("[red]Enter a number of 0 or more.[/]"))));
+
+        return text is null ? null : double.Parse(text, NumberStyles.Float, CultureInfo.InvariantCulture);
+    }
+
+    private static DateTime? PromptOptionalDate(string label)
+    {
+        string? text = OptionalResult(AnsiConsole.Prompt(
+            new TextPrompt<string>($"[bold]{label}[/] yyyy-MM-dd (optional):")
+                .AllowEmpty()
+                .Validate(t => string.IsNullOrWhiteSpace(t) || ValidateDate(t)
+                    ? ValidationResult.Success()
+                    : ValidationResult.Error("[red]Use yyyy-MM-dd, e.g. 2026-10-20.[/]"))));
+
+        return text is null ? null : DateTime.ParseExact(text, "yyyy-MM-dd", CultureInfo.InvariantCulture);
     }
 
     /// <summary>
@@ -1473,64 +1794,39 @@ internal static class Program
     }
 
     /// <summary>
-    /// Asks for a start date (required) and an end date (default = today), each with an
-    /// optional time-of-day component, then renders the Top 10 largest files in that window.
+    /// Asks for a minimum file size in MB (default 500) and renders the largest recorded files at or above it.
     /// </summary>
-    private static void PromptAndRenderTopFilesInRange()
+    private static void PromptAndRenderTopFilesAboveSize()
     {
-        string startDateInput = AnsiConsole.Prompt(
-            new TextPrompt<string>("[bold]Start date[/] (yyyy-MM-dd):")
-                .DefaultValue(DateTime.Today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))
-                .ValidationErrorMessage("[red]Invalid date. Use yyyy-MM-dd, e.g. 2026-10-20.[/]")
-                .Validate(ValidateDate));
+        double minMb = AnsiConsole.Prompt(
+            new TextPrompt<double>("[bold]Minimum file size[/] (MB):")
+                .DefaultValue(500.0)
+                .ValidationErrorMessage("[red]Enter a non-negative number.[/]")
+                .Validate(v => v >= 0 ? ValidationResult.Success() : ValidationResult.Error("[red]Must be 0 or greater.[/]")));
 
-        string startTimeInput = AnsiConsole.Prompt(
-            new TextPrompt<string>("[bold]Start time[/] (HH:mm, optional):")
-                .DefaultValue("00:00")
-                .ValidationErrorMessage("[red]Invalid time. Use 24h HH:mm, e.g. 14:30.[/]")
-                .Validate(ValidateTime));
-
-        string endDateInput = AnsiConsole.Prompt(
-            new TextPrompt<string>("[bold]End date[/] (yyyy-MM-dd, optional):")
-                .DefaultValue(DateTime.Today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))
-                .ValidationErrorMessage("[red]Invalid date. Use yyyy-MM-dd, e.g. 2026-10-26.[/]")
-                .Validate(ValidateDate));
-
-        string endTimeInput = AnsiConsole.Prompt(
-            new TextPrompt<string>("[bold]End time[/] (HH:mm, optional):")
-                .DefaultValue(DateTime.Now.ToString("HH:mm", CultureInfo.InvariantCulture))
-                .ValidationErrorMessage("[red]Invalid time. Use 24h HH:mm, e.g. 23:59.[/]")
-                .Validate(ValidateTime));
-
-        DateTime startDate = DateTime.ParseExact(startDateInput.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture);
-        DateTime endDate = DateTime.ParseExact(endDateInput.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture);
-        TimeSpan startTime = ParseFlexibleTime(startTimeInput);
-        TimeSpan endTime = ParseFlexibleTime(endTimeInput);
-
-        DateTime from = startDate.Date + startTime;
-        DateTime to = endDate.Date + endTime;
-
-        if (from > to)
-        {
-            (from, to) = (to, from); // be forgiving if the user swaps the range by mistake
-        }
-
-        ReportRenderer.RenderTopFilesInRange(from, to);
+        ReportRenderer.RenderTopFilesAboveSize((long)(minMb * 1024 * 1024));
     }
 
     private static bool ValidateDate(string input) =>
         DateTime.TryParseExact(input.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _);
 
-    private static bool ValidateTime(string input) =>
-        TimeSpan.TryParseExact(input.Trim(), @"hh\:mm", CultureInfo.InvariantCulture, out _) ||
-        TimeSpan.TryParseExact(input.Trim(), @"h\:mm", CultureInfo.InvariantCulture, out _);
+    /// <summary>Returns null when the user leaves the prompt blank, otherwise the trimmed text.</summary>
+    private static string? OptionalResult(string input) =>
+        string.IsNullOrWhiteSpace(input) ? null : input.Trim();
 
-    private static TimeSpan ParseFlexibleTime(string input)
+    /// <summary>Parses "1, 5, 12" into IDs. Returns null if any token is not a positive integer.</summary>
+    private static List<long>? ParseIds(string input)
     {
-        string trimmed = input.Trim();
-        return TimeSpan.TryParseExact(trimmed, @"hh\:mm", CultureInfo.InvariantCulture, out var result)
-            ? result
-            : TimeSpan.ParseExact(trimmed, @"h\:mm", CultureInfo.InvariantCulture);
+        var ids = new List<long>();
+        foreach (var token in input.Split([',', ' '], StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (!long.TryParse(token, NumberStyles.None, CultureInfo.InvariantCulture, out long id) || id <= 0)
+            {
+                return null;
+            }
+            ids.Add(id);
+        }
+        return ids.Distinct().ToList();
     }
 
     private static DiskWatcherService? RunBackgroundTracking(DiskWatcherService? existing)
@@ -1589,6 +1885,62 @@ internal static class Program
         return existing;
     }
 
+    private static void ConfigureTrayMonitoring()
+    {
+        AnsiConsole.MarkupLine("[grey]Choose one or more non-overlapping folders. Tray monitoring starts now and is scheduled at Windows logon.[/]");
+        var rootPaths = new List<string>();
+
+        do
+        {
+            string rootPath = AnsiConsole.Prompt(
+                new TextPrompt<string>("[bold]Folder to monitor in the tray[/]:")
+                    .Validate(path =>
+                    {
+                        if (!Directory.Exists(path))
+                        {
+                            return ValidationResult.Error("[red]Folder does not exist.[/]");
+                        }
+
+                        try
+                        {
+                            TrayMonitoringSettings.ValidatePaths(rootPaths.Append(path));
+                            return ValidationResult.Success();
+                        }
+                        catch (ArgumentException)
+                        {
+                            return ValidationResult.Error("[red]Folders cannot be duplicates or nested inside one another.[/]");
+                        }
+                    }));
+
+            rootPaths.Add(Path.GetFullPath(rootPath));
+        }
+        while (AnsiConsole.Confirm("[bold]Add another folder?[/]", defaultValue: false));
+
+        TrayMonitoringSettings.Save(rootPaths);
+        AnsiConsole.MarkupLine($"[green]Tray folders saved:[/] {Markup.Escape(string.Join(", ", rootPaths))}");
+
+        int startupResult = StartupTask.Install();
+        if (startupResult != 0)
+        {
+            AnsiConsole.MarkupLine("[yellow]Tray monitoring will start now, but automatic logon startup was not enabled. Run setup again from an Administrator terminal to register it.[/]");
+        }
+
+        if (TrayHost.NotifyConfigurationChanged())
+        {
+            AnsiConsole.MarkupLine("[green]The running tray monitor has been updated with these folders.[/]");
+        }
+        else
+        {
+            TrayHost.StartDetached();
+            AnsiConsole.MarkupLine("[green]Tray monitoring started in the notification area.[/]");
+        }
+
+        if (startupResult == 0)
+        {
+            AnsiConsole.MarkupLine("[green]Automatic tray monitoring is enabled for future logons.[/]");
+        }
+    }
+
     /// <summary>
     /// Builds the live tracking screen: a status line, the "Hot Write Paths" churn/burst
     /// radar table (for manual cleanup — nothing is auto-deleted), and a rolling activity log.
@@ -1639,4 +1991,3 @@ internal static class Program
         return new Rows(header, hotTable, logPanel);
     }
 }
-
